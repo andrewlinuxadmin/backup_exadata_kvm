@@ -1,0 +1,88 @@
+---
+- name: Backup das VMs KVM do Exadata
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    backup_exadata_kvm_dest_base: /mnt
+    backup_exadata_kvm_vm_pattern: "exa04*.intra.local"
+    backup_exadata_kvm_guest_images_dir: /EXAVMIMAGES/GuestImages
+    backup_exadata_kvm_timestamp_format: "%Y-%m-%d-%Hh%M"
+    backup_exadata_kvm_retention: 3
+    # false = falha de uma VM não impede o backup das demais
+    backup_exadata_kvm_fail_on_error: false
+
+  tasks:
+    - name: Coletar pontos de montagem
+      ansible.builtin.setup:
+        gather_subset: ["!all", "!min", "hardware"]
+        filter: ansible_mounts
+
+    - name: Garantir que o NFS de destino está montado
+      ansible.builtin.assert:
+        that: >-
+          ansible_facts.mounts
+          | selectattr('mount', 'equalto', backup_exadata_kvm_dest_base)
+          | selectattr('fstype', 'match', 'nfs')
+          | list | length > 0
+        fail_msg: "ERRO CRITICO: {{ backup_exadata_kvm_dest_base }} não está montado via NFS!"
+
+    - name: Validar retenção
+      ansible.builtin.assert:
+        that: backup_exadata_kvm_retention | int >= 1
+        quiet: true
+
+    # Timestamp único da execução: todas as VMs ficam em <dest_base>/<timestamp>/
+    - name: Definir timestamp da execução
+      ansible.builtin.set_fact:
+        backup_exadata_kvm_timestamp: "{{ now(fmt=backup_exadata_kvm_timestamp_format) }}"
+
+    - name: Localizar VMs
+      ansible.builtin.find:
+        paths: "{{ backup_exadata_kvm_guest_images_dir }}"
+        patterns: "{{ backup_exadata_kvm_vm_pattern }}"
+        file_type: directory
+      register: backup_exadata_kvm_vms_found
+
+    - name: Definir lista de VMs
+      ansible.builtin.set_fact:
+        backup_exadata_kvm_vms: "{{ backup_exadata_kvm_vms_found.files | map(attribute='path') | map('basename') | sort }}"
+
+    - name: Falhar se nenhuma VM foi encontrada
+      ansible.builtin.assert:
+        that: backup_exadata_kvm_vms | length > 0
+        fail_msg: "Nenhuma VM encontrada com o padrão {{ backup_exadata_kvm_vm_pattern }}"
+        quiet: true
+
+    - name: Executar backup de cada VM
+      ansible.builtin.include_role:
+        name: backup_exadata_kvm
+      vars:
+        backup_exadata_kvm_vm_name: "{{ vm }}"
+      loop: "{{ backup_exadata_kvm_vms }}"
+      loop_control:
+        loop_var: vm
+
+    # Retenção: considera apenas pastas <timestamp> com ao menos um backup_report.yml,
+    # evitando apagar outros conteúdos do NFS.
+    - name: Localizar backups concluídos
+      ansible.builtin.find:
+        paths: "{{ backup_exadata_kvm_dest_base }}"
+        patterns: backup_report.yml
+        recurse: true
+        depth: 3
+      register: backup_exadata_kvm_done
+
+    - name: Remover backups antigos
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: >-
+        {{ (backup_exadata_kvm_done.files | sort(attribute='mtime') | map(attribute='path')
+        | map('dirname') | map('dirname') | unique | list)[: -(backup_exadata_kvm_retention | int)] }}
+
+    - name: Reportar VMs com falha
+      ansible.builtin.assert:
+        that: backup_exadata_kvm_failed_vms | default([]) | length == 0
+        fail_msg: "Backup falhou para: {{ backup_exadata_kvm_failed_vms | default([]) | join(', ') }}"
+        success_msg: "Backup concluído para todas as VMs: {{ backup_exadata_kvm_vms | join(', ') }}"

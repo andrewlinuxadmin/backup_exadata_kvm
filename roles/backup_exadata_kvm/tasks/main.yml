@@ -1,0 +1,219 @@
+---
+- name: Validar parâmetros
+  ansible.builtin.assert:
+    that: backup_exadata_kvm_vm_name | length > 0
+    fail_msg: "Informe a VM em backup_exadata_kvm_vm_name"
+    quiet: true
+
+- name: Definir timestamp do backup
+  ansible.builtin.set_fact:
+    backup_exadata_kvm_ts: "{{ backup_exadata_kvm_timestamp or now(fmt=backup_exadata_kvm_timestamp_format) }}"
+    backup_exadata_kvm_started: "{{ now(fmt='%Y-%m-%d %H:%M:%S') }}"
+
+- name: Definir caminhos do backup
+  ansible.builtin.set_fact:
+    backup_exadata_kvm_src: "{{ backup_exadata_kvm_guest_images_dir }}/{{ backup_exadata_kvm_vm_name }}"
+    backup_exadata_kvm_tmp: "{{ backup_exadata_kvm_tmp_base }}/Backup-{{ backup_exadata_kvm_vm_name }}-{{ backup_exadata_kvm_ts }}"
+    backup_exadata_kvm_dest: "{{ backup_exadata_kvm_dest_base }}/{{ backup_exadata_kvm_ts }}/{{ backup_exadata_kvm_vm_name }}"
+    backup_exadata_kvm_tar: >-
+      {{ backup_exadata_kvm_dest_base }}/{{ backup_exadata_kvm_ts }}/{{ backup_exadata_kvm_vm_name
+      }}/{{ backup_exadata_kvm_vm_name }}-{{ backup_exadata_kvm_ts }}.tar
+
+- name: "Backup da VM {{ backup_exadata_kvm_vm_name }}"
+  block:
+    - name: Verificar se a VM existe
+      ansible.builtin.stat:
+        path: "{{ backup_exadata_kvm_src }}"
+      register: backup_exadata_kvm_src_stat
+
+    - name: Falhar se a VM não existir
+      ansible.builtin.assert:
+        that: backup_exadata_kvm_src_stat.stat.isdir | default(false)
+        fail_msg: "Guest {{ backup_exadata_kvm_vm_name }} não existe em {{ backup_exadata_kvm_guest_images_dir }}"
+        quiet: true
+
+    - name: Criar diretório de destino no NFS
+      ansible.builtin.file:
+        path: "{{ backup_exadata_kvm_dest }}"
+        state: directory
+        mode: "0750"
+
+    - name: Listar arquivos e diretórios da VM
+      ansible.builtin.find:
+        paths: "{{ backup_exadata_kvm_src }}"
+        file_type: any
+        recurse: true
+        hidden: true
+      register: backup_exadata_kvm_src_find
+
+    - name: Separar diretórios e arquivos (ignorando lost+found)
+      ansible.builtin.set_fact:
+        backup_exadata_kvm_dirs: >-
+          {{ [backup_exadata_kvm_src] + (backup_exadata_kvm_src_find.files | selectattr('isdir')
+          | rejectattr('path', 'search', 'lost.found') | map(attribute='path') | list) }}
+        backup_exadata_kvm_files: "{{ backup_exadata_kvm_src_find.files | selectattr('isreg') | rejectattr('path', 'search', 'lost.found') | list }}"
+
+    - name: Criar estrutura do diretório temporário
+      ansible.builtin.file:
+        path: "{{ backup_exadata_kvm_tmp }}{{ item }}"
+        state: directory
+        mode: "0750"
+      loop: "{{ backup_exadata_kvm_dirs + ['/XML'] }}"
+
+    - name: Copiar XML do libvirt
+      ansible.builtin.copy:
+        src: "{{ backup_exadata_kvm_libvirt_xml_dir }}/{{ backup_exadata_kvm_vm_name }}.xml"
+        dest: "{{ backup_exadata_kvm_tmp }}/XML/"
+        remote_src: true
+        mode: preserve
+
+    # Não há módulo Ansible que faça cópia via reflink (instantânea, sem duplicar blocos).
+    - name: Criar reflinks das imagens da VM
+      ansible.builtin.command:
+        argv:
+          - cp
+          - "--reflink={{ backup_exadata_kvm_reflink }}"
+          - --preserve=all
+          - "{{ item.path }}"
+          - "{{ backup_exadata_kvm_tmp }}{{ item.path }}"
+        creates: "{{ backup_exadata_kvm_tmp }}{{ item.path }}"
+      loop: "{{ backup_exadata_kvm_files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # O módulo archive não preserva ACLs/xattrs nem gera formato pax.
+    - name: Gerar arquivo tar no NFS
+      ansible.builtin.command:
+        argv: "{{ ['tar'] + backup_exadata_kvm_tar_options + ['-cvf', backup_exadata_kvm_tar, '.'] }}"
+        chdir: "{{ backup_exadata_kvm_tmp }}"
+      async: "{{ backup_exadata_kvm_async_timeout }}"
+      poll: "{{ backup_exadata_kvm_async_poll }}"
+      register: backup_exadata_kvm_tar_result
+      changed_when: true
+      failed_when: false
+
+    - name: Gravar evidência - saída do tar
+      ansible.builtin.copy:
+        content: "{{ backup_exadata_kvm_tar_result.stdout | default('') }}\n"
+        dest: "{{ backup_exadata_kvm_dest }}/tar.stdout.log"
+        mode: "0640"
+
+    - name: Gravar evidência - erros do tar
+      ansible.builtin.copy:
+        content: "{{ backup_exadata_kvm_tar_result.stderr | default('') }}\n"
+        dest: "{{ backup_exadata_kvm_dest }}/tar.stderr.log"
+        mode: "0640"
+
+    - name: Validar retorno do tar
+      ansible.builtin.assert:
+        that: backup_exadata_kvm_tar_result.rc | default(-1) == 0
+        fail_msg: >-
+          tar retornou {{ backup_exadata_kvm_tar_result.rc | default('N/A') }}:
+          {{ backup_exadata_kvm_tar_result.stderr | default(backup_exadata_kvm_tar_result.msg | default('')) }}
+        quiet: true
+
+    - name: Comparar conteúdo do tar com os arquivos de origem
+      ansible.builtin.command:
+        argv: ["tar", "--compare", "-f", "{{ backup_exadata_kvm_tar }}"]
+        chdir: "{{ backup_exadata_kvm_tmp }}"
+      async: "{{ backup_exadata_kvm_async_timeout }}"
+      poll: "{{ backup_exadata_kvm_async_poll }}"
+      register: backup_exadata_kvm_verify_result
+      changed_when: false
+      failed_when: false
+      when: backup_exadata_kvm_verify | bool
+
+    - name: Gravar evidência - verificação do tar
+      ansible.builtin.copy:
+        content: |
+          rc={{ backup_exadata_kvm_verify_result.rc | default('N/A') }}
+          {{ backup_exadata_kvm_verify_result.stdout | default('') }}
+          {{ backup_exadata_kvm_verify_result.stderr | default('') }}
+        dest: "{{ backup_exadata_kvm_dest }}/tar.verify.log"
+        mode: "0640"
+      when: backup_exadata_kvm_verify | bool
+
+    - name: Validar verificação do tar
+      ansible.builtin.assert:
+        that: backup_exadata_kvm_verify_result.rc | default(-1) == 0
+        fail_msg: "tar --compare encontrou diferenças. Ver {{ backup_exadata_kvm_dest }}/tar.verify.log"
+        quiet: true
+      when: backup_exadata_kvm_verify | bool
+
+    - name: Remover diretório temporário
+      ansible.builtin.file:
+        path: "{{ backup_exadata_kvm_tmp }}"
+        state: absent
+
+    - name: Obter tamanho e checksum do arquivo tar
+      ansible.builtin.stat:
+        path: "{{ backup_exadata_kvm_tar }}"
+        get_checksum: "{{ backup_exadata_kvm_checksum | bool }}"
+        checksum_algorithm: "{{ backup_exadata_kvm_checksum_algorithm }}"
+      async: "{{ backup_exadata_kvm_async_timeout }}"
+      poll: "{{ backup_exadata_kvm_async_poll }}"
+      register: backup_exadata_kvm_tar_stat
+
+    - name: Gravar evidência - checksum (compatível com sha256sum -c)
+      ansible.builtin.copy:
+        content: "{{ backup_exadata_kvm_tar_stat.stat.checksum }}  {{ backup_exadata_kvm_tar | basename }}\n"
+        dest: "{{ backup_exadata_kvm_tar }}.{{ backup_exadata_kvm_checksum_algorithm }}"
+        mode: "0640"
+      when: backup_exadata_kvm_checksum | bool
+
+    - name: Gravar relatório do backup (marca de sucesso)
+      ansible.builtin.copy:
+        content: "{{ backup_exadata_kvm_report | to_nice_yaml(indent=2) }}"
+        dest: "{{ backup_exadata_kvm_dest }}/{{ backup_exadata_kvm_report_file }}"
+        mode: "0640"
+      vars:
+        backup_exadata_kvm_report:
+          status: success
+          vm: "{{ backup_exadata_kvm_vm_name }}"
+          host: "{{ inventory_hostname }}"
+          timestamp: "{{ backup_exadata_kvm_ts }}"
+          started: "{{ backup_exadata_kvm_started }}"
+          finished: "{{ now(fmt='%Y-%m-%d %H:%M:%S') }}"
+          archive: "{{ backup_exadata_kvm_tar }}"
+          size_bytes: "{{ backup_exadata_kvm_tar_stat.stat.size }}"
+          checksum: >-
+            {{ (backup_exadata_kvm_checksum_algorithm ~ ':' ~ backup_exadata_kvm_tar_stat.stat.checksum)
+            if backup_exadata_kvm_checksum | bool else 'disabled' }}
+          tar_rc: "{{ backup_exadata_kvm_tar_result.rc }}"
+          verify_rc: "{{ backup_exadata_kvm_verify_result.rc | default('disabled') }}"
+          files: "{{ backup_exadata_kvm_files | items2dict(key_name='path', value_name='size') }}"
+
+  rescue:
+    - name: Gravar evidência de falha
+      ansible.builtin.copy:
+        content: "{{ backup_exadata_kvm_failure | to_nice_yaml(indent=2) }}"
+        dest: "{{ backup_exadata_kvm_dest }}/{{ backup_exadata_kvm_failed_file }}"
+        mode: "0640"
+      vars:
+        backup_exadata_kvm_failure:
+          status: failed
+          vm: "{{ backup_exadata_kvm_vm_name }}"
+          timestamp: "{{ backup_exadata_kvm_ts }}"
+          failed_task: "{{ ansible_failed_task.name }}"
+          message: "{{ ansible_failed_result.msg | default('') }}"
+      ignore_errors: true  # noqa: ignore-errors - o destino pode não existir
+
+    - name: Registrar VM com falha
+      ansible.builtin.set_fact:
+        backup_exadata_kvm_failed_vms: "{{ backup_exadata_kvm_failed_vms | default([]) + [backup_exadata_kvm_vm_name] }}"
+
+    - name: Abortar backup
+      ansible.builtin.fail:
+        msg: "Backup da VM {{ backup_exadata_kvm_vm_name }} falhou na tarefa '{{ ansible_failed_task.name }}'"
+      when: backup_exadata_kvm_fail_on_error | bool
+
+    - name: Seguir para a próxima VM
+      ansible.builtin.debug:
+        msg: "FALHA no backup da VM {{ backup_exadata_kvm_vm_name }} (tarefa '{{ ansible_failed_task.name }}'). Continuando."
+      when: not backup_exadata_kvm_fail_on_error | bool
+
+  always:
+    - name: Garantir remoção do diretório temporário
+      ansible.builtin.file:
+        path: "{{ backup_exadata_kvm_tmp }}"
+        state: absent

@@ -1,0 +1,43 @@
+---
+# Nome da VM (diretório em backup_exadata_kvm_guest_images_dir). Obrigatório.
+backup_exadata_kvm_vm_name: ""
+
+# Origem das imagens e definição libvirt
+backup_exadata_kvm_guest_images_dir: /EXAVMIMAGES/GuestImages
+backup_exadata_kvm_libvirt_xml_dir: /etc/libvirt/qemu
+
+# Base do diretório temporário. DEVE estar no mesmo filesystem das imagens (reflink).
+# Diretório final: <tmp_base>/Backup-<vm>-<timestamp>
+backup_exadata_kvm_tmp_base: /EXAVMIMAGES/backups
+
+# Destino (NFS). Backup gravado em: <dest_base>/<timestamp>/<vm>/<vm>-<timestamp>.tar
+backup_exadata_kvm_dest_base: /mnt
+
+# Timestamp do backup. Vazio = gerado no início da execução.
+backup_exadata_kvm_timestamp: ""
+backup_exadata_kvm_timestamp_format: "%Y-%m-%d-%Hh%M"
+
+# Modo do cp --reflink (always = falha se o filesystem não suportar reflink)
+backup_exadata_kvm_reflink: always
+
+# Opções do tar (mesmas do script original)
+backup_exadata_kvm_tar_options:
+  - --acls
+  - --xattrs
+  - --xattrs-include=*
+  - --format=pax
+
+# Evidências de integridade
+backup_exadata_kvm_verify: true                  # tar --compare do arquivo contra os reflinks
+backup_exadata_kvm_checksum: true                # gera <arquivo>.tar.<algoritmo>
+backup_exadata_kvm_checksum_algorithm: sha256
+backup_exadata_kvm_report_file: backup_report.yml  # gravado somente em caso de sucesso
+backup_exadata_kvm_failed_file: backup_failed.yml  # gravado em caso de falha
+
+# true = falha do backup interrompe a execução.
+# false = registra a VM em backup_exadata_kvm_failed_vms e segue sem erro.
+backup_exadata_kvm_fail_on_error: true
+
+# Tarefas longas (tar, verificação, checksum) rodam em modo assíncrono
+backup_exadata_kvm_async_timeout: 86400  # segundos
+backup_exadata_kvm_async_poll: 60        # segundos
