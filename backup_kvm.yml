@@ -5,12 +5,16 @@
   gather_facts: false
   vars:
     backup_exadata_kvm_dest_base: /mnt
-    backup_exadata_kvm_vm_pattern: "exa04*.intra.local"
+    vm_pattern: "exa04*.intra.local"
     backup_exadata_kvm_guest_images_dir: /EXAVMIMAGES/GuestImages
     backup_exadata_kvm_timestamp_format: "%Y-%m-%d-%Hh%M"
-    backup_exadata_kvm_retention: 3
     # false = falha de uma VM não impede o backup das demais
     backup_exadata_kvm_fail_on_error: false
+    # 0 = automática (quantos backups cabem no volume NFS).
+    # > 0 = limite máximo, respeitando o que cabe no volume.
+    retention: 0
+    # Margem sobre o tamanho das VMs para estimar o tamanho do backup (%)
+    space_margin_pct: 10
 
   tasks:
     - name: Coletar pontos de montagem
@@ -27,9 +31,14 @@
           | list | length > 0
         fail_msg: "ERRO CRITICO: {{ backup_exadata_kvm_dest_base }} não está montado via NFS!"
 
+    - name: Obter tamanho total e espaço livre do NFS
+      ansible.builtin.set_fact:
+        nfs: >-
+          {{ ansible_facts.mounts | selectattr('mount', 'equalto', backup_exadata_kvm_dest_base) | first }}
+
     - name: Validar retenção
       ansible.builtin.assert:
-        that: backup_exadata_kvm_retention | int >= 1
+        that: retention | int >= 0
         quiet: true
 
     # Timestamp único da execução: todas as VMs ficam em <dest_base>/<timestamp>/
@@ -40,49 +49,138 @@
     - name: Localizar VMs
       ansible.builtin.find:
         paths: "{{ backup_exadata_kvm_guest_images_dir }}"
-        patterns: "{{ backup_exadata_kvm_vm_pattern }}"
+        patterns: "{{ vm_pattern }}"
         file_type: directory
-      register: backup_exadata_kvm_vms_found
+      register: vms_found
 
     - name: Definir lista de VMs
       ansible.builtin.set_fact:
-        backup_exadata_kvm_vms: "{{ backup_exadata_kvm_vms_found.files | map(attribute='path') | map('basename') | sort }}"
+        vms: "{{ vms_found.files | map(attribute='path') | map('basename') | sort }}"
 
     - name: Falhar se nenhuma VM foi encontrada
       ansible.builtin.assert:
-        that: backup_exadata_kvm_vms | length > 0
-        fail_msg: "Nenhuma VM encontrada com o padrão {{ backup_exadata_kvm_vm_pattern }}"
+        that: vms | length > 0
+        fail_msg: "Nenhuma VM encontrada com o padrão {{ vm_pattern }}"
         quiet: true
 
-    - name: Executar backup de cada VM
-      ansible.builtin.include_role:
-        name: backup_exadata_kvm
-      vars:
-        backup_exadata_kvm_vm_name: "{{ vm }}"
-      loop: "{{ backup_exadata_kvm_vms }}"
-      loop_control:
-        loop_var: vm
+    # ---------------------------------------------------------------------------
+    # Espaço e retenção
+    # ---------------------------------------------------------------------------
+    - name: Listar arquivos das VMs
+      ansible.builtin.find:
+        paths: "{{ vms_found.files | map(attribute='path') | list }}"
+        file_type: file
+        recurse: true
+        hidden: true
+      register: vm_files
 
-    # Retenção: considera apenas pastas <timestamp> com ao menos um backup_report.yml,
+    # O tar grava o tamanho aparente dos arquivos (st_size), mesmo de imagens esparsas.
+    - name: Calcular espaço necessário para o backup
+      ansible.builtin.set_fact:
+        required_size: >-
+          {{ ((vm_files.files | map(attribute='size') | sum)
+          * (100 + space_margin_pct | int) / 100) | int }}
+
+    - name: Falhar se o backup não cabe no volume NFS
+      ansible.builtin.assert:
+        that: nfs.size_total | int >= required_size | int
+        fail_msg: >-
+          Backup ({{ required_size | int | human_readable }}) maior que o volume NFS
+          ({{ nfs.size_total | human_readable }}).
+
+    - name: Calcular retenção
+      ansible.builtin.set_fact:
+        capacity: "{{ nfs.size_total // required_size | int }}"
+        retention_eff: >-
+          {{ [nfs.size_total // required_size | int,
+              retention | int or 999999] | min }}
+
+    # Considera apenas pastas <timestamp> com ao menos um backup_report.yml,
     # evitando apagar outros conteúdos do NFS.
-    - name: Localizar backups concluídos
+    - name: Localizar backups existentes
       ansible.builtin.find:
         paths: "{{ backup_exadata_kvm_dest_base }}"
         patterns: backup_report.yml
         recurse: true
         depth: 3
-      register: backup_exadata_kvm_done
+      register: backups_found
+
+    - name: Listar backups existentes (mais antigo primeiro)
+      ansible.builtin.set_fact:
+        backups: >-
+          {{ backups_found.files | sort(attribute='mtime') | map(attribute='path')
+          | map('dirname') | map('dirname') | unique | list }}
+
+    - name: Listar arquivos dos backups existentes
+      ansible.builtin.find:
+        paths: "{{ backups }}"
+        file_type: file
+        recurse: true
+        hidden: true
+      register: backup_files
+      when: backups | length > 0
+
+    # Remove, do mais antigo para o mais novo:
+    # - os backups que excedem a retenção (mantendo espaço para o novo backup), e
+    # - apenas os necessários para liberar espaço para o novo backup.
+    - name: Iniciar plano de remoção
+      ansible.builtin.set_fact:
+        backups_to_remove: []
+        free_after_removal: "{{ nfs.size_available }}"
+
+    - name: Planejar remoção de backups antigos
+      ansible.builtin.set_fact:
+        backups_to_remove: "{{ backups_to_remove + [item] }}"
+        free_after_removal: >-
+          {{ free_after_removal | int + (backup_files.files
+          | selectattr('path', 'search', '^' ~ (item | regex_escape) ~ '/')
+          | map(attribute='size') | sum) }}
+      loop: "{{ backups }}"
+      loop_control:
+        index_var: idx
+      when: >-
+        idx < (backups | length) - (retention_eff | int - 1)
+        or free_after_removal | int < required_size | int
+
+    - name: Resumo de espaço
+      ansible.builtin.debug:
+        msg:
+          - "NFS total ......... {{ nfs.size_total | human_readable }}"
+          - "NFS livre ......... {{ nfs.size_available | human_readable }}"
+          - "Backup necessário . {{ required_size | int | human_readable }}"
+          - "Backups que cabem . {{ capacity }}"
+          - "Retenção .......... {{ retention_eff }}"
+          - "Backups a remover . {{ backups_to_remove | map('basename') | join(', ') or 'nenhum' }}"
+          - "Livre após remoção  {{ free_after_removal | int | human_readable }}"
+
+    - name: Falhar se não houver espaço mesmo removendo backups antigos
+      ansible.builtin.assert:
+        that: free_after_removal | int >= required_size | int
+        fail_msg: >-
+          Espaço insuficiente: backup requer {{ required_size | int | human_readable }},
+          disponível após remover todos os backups antigos
+          {{ free_after_removal | int | human_readable }}. Nenhum backup foi removido.
 
     - name: Remover backups antigos
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
-      loop: >-
-        {{ (backup_exadata_kvm_done.files | sort(attribute='mtime') | map(attribute='path')
-        | map('dirname') | map('dirname') | unique | list)[: -(backup_exadata_kvm_retention | int)] }}
+      loop: "{{ backups_to_remove }}"
+
+    # ---------------------------------------------------------------------------
+    # Backup
+    # ---------------------------------------------------------------------------
+    - name: Executar backup de cada VM
+      ansible.builtin.include_role:
+        name: backup_exadata_kvm
+      vars:
+        backup_exadata_kvm_vm_name: "{{ vm }}"
+      loop: "{{ vms }}"
+      loop_control:
+        loop_var: vm
 
     - name: Reportar VMs com falha
       ansible.builtin.assert:
         that: backup_exadata_kvm_failed_vms | default([]) | length == 0
         fail_msg: "Backup falhou para: {{ backup_exadata_kvm_failed_vms | default([]) | join(', ') }}"
-        success_msg: "Backup concluído para todas as VMs: {{ backup_exadata_kvm_vms | join(', ') }}"
+        success_msg: "Backup concluído para todas as VMs: {{ vms | join(', ') }}"

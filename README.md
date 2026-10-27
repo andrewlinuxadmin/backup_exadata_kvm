@@ -26,7 +26,7 @@ Exemplos:
 # Limitar a um host do inventário e usar outro padrão de VMs
 ansible-playbook -i inventario backup_kvm.yml \
   -l exadata01 \
-  -e 'backup_exadata_kvm_vm_pattern=vm*.dominio.local'
+  -e 'vm_pattern=vm*.dominio.local'
 
 # Interromper na primeira falha (comportamento do script original)
 ansible-playbook -i inventario backup_kvm.yml -e backup_exadata_kvm_fail_on_error=true
@@ -38,9 +38,9 @@ ansible-playbook -i inventario backup_kvm.yml -e backup_exadata_kvm_fail_on_erro
 
 1. Verifica se `backup_exadata_kvm_dest_base` está montado via NFS.
 2. Gera um timestamp único para a execução.
-3. Localiza as VMs em `backup_exadata_kvm_guest_images_dir` pelo padrão `backup_exadata_kvm_vm_pattern`.
-4. Executa a role para cada VM, sequencialmente.
-5. Mantém os últimos `backup_exadata_kvm_retention` backups e remove os mais antigos.
+3. Localiza as VMs em `backup_exadata_kvm_guest_images_dir` pelo padrão `vm_pattern`.
+4. Verifica o espaço no NFS, calcula a retenção e remove backups antigos (ver [Espaço e retenção](#espaço-e-retenção)).
+5. Executa a role para cada VM, sequencialmente.
 6. Falha ao final se algum backup falhou, listando as VMs.
 
 **Role (por VM)**
@@ -68,13 +68,28 @@ ansible-playbook -i inventario backup_kvm.yml -e backup_exadata_kvm_fail_on_erro
 O `backup_report.yml` contém VM, host, início/fim, tamanho, checksum, códigos de retorno
 do tar e da verificação, e a lista de arquivos incluídos.
 
-## Retenção
+## Espaço e retenção
+
+Executado pelo playbook **antes** do backup:
+
+1. Obtém o tamanho total e o espaço livre do volume NFS.
+2. Calcula o espaço necessário: soma do tamanho das VMs + `space_margin_pct`.
+   É usado o tamanho aparente dos arquivos, pois o tar grava imagens esparsas por inteiro.
+3. Falha se o backup for maior que o volume NFS inteiro.
+4. Calcula quantos backups cabem no volume (`total / necessário`). Essa é a retenção,
+   limitada por `retention` quando maior que 0.
+5. Planeja a remoção, do backup mais antigo para o mais novo:
+   - os que excedem a retenção (contando o novo backup), e
+   - apenas os necessários para que o espaço livre comporte o novo backup.
+6. Falha, sem remover nada, se mesmo removendo todos os backups antigos não houver espaço.
+7. Remove os backups planejados.
+
+Regras:
 
 - Considera apenas pastas `<timestamp>` que tenham ao menos um `backup_report.yml`,
   para não apagar outros conteúdos do NFS.
 - Remove a pasta `<timestamp>` inteira (todas as VMs daquela execução).
-- Roda mesmo quando alguma VM falhou. Se uma VM falhar em execuções seguidas, seu último
-  backup bom pode ser removido.
+- Outros conteúdos do NFS ocupam espaço mas não são removidos; se impedirem o backup, o playbook falha.
 
 ## Variáveis
 
@@ -82,8 +97,9 @@ do tar e da verificação, e a lista de arquivos incluídos.
 
 | Variável | Padrão | Descrição |
 |---|---|---|
-| `backup_exadata_kvm_vm_pattern` | `exa04*.intra.local` | Padrão (glob) do nome das VMs |
-| `backup_exadata_kvm_retention` | `3` | Quantidade de backups mantidos no NFS |
+| `vm_pattern` | `exa04*.intra.local` | Padrão (glob) do nome das VMs |
+| `retention` | `0` | Backups mantidos no NFS. `0` = automático (quantos cabem no volume); `> 0` = limite máximo |
+| `space_margin_pct` | `10` | Margem (%) sobre o tamanho das VMs para estimar o backup |
 | `backup_exadata_kvm_fail_on_error` | `false` | `true` interrompe na primeira VM com falha |
 
 ### Role
